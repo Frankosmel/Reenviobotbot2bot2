@@ -1,13 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# ── 0) Monkey-patch APScheduler timezone issue ──
+import apscheduler.util
+import pytz
+
+def _safe_astimezone(timezone):
+    # Si no hay timezone, usar UTC
+    if timezone is None:
+        return pytz.UTC
+    # Si ya es un tzinfo (zoneinfo o pytz), devolverlo
+    if hasattr(timezone, "utcoffset"):
+        return timezone
+    # Si viene como string o tiene atributo .zone, intentar convertir
+    name = None
+    if isinstance(timezone, str):
+        name = timezone
+    else:
+        name = getattr(timezone, "zone", None)
+    if name:
+        try:
+            return pytz.timezone(name)
+        except:
+            pass
+    # Fallback
+    return pytz.UTC
+
+apscheduler.util.astimezone = _safe_astimezone
+
+# ── Imports estándar ──
 import logging
 from datetime import datetime
-import pytz
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telegram.ext import (
@@ -19,20 +45,21 @@ from telegram.ext import (
 )
 from config_manager import load_config, save_config, load_mensajes, save_mensajes
 
+# ── Logging ──
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# == Teclado Principal ==
-MAIN_KEYBOARD = ReplyKeyboardMarkup([
+# ── Teclados ──
+MAIN_KB = ReplyKeyboardMarkup([
     ["🔗 Vincular Canal", "📂 Destinos"],
     ["✏️ Editar Mensaje", "🗑️ Eliminar Mensaje"],
     ["🔁 Cambiar Intervalo", "🌐 Cambiar Zona"],
     ["📄 Estado del Bot"]
 ], resize_keyboard=True)
 
-BACK_KEYBOARD = ReplyKeyboardMarkup([["🔙 Volver"]], resize_keyboard=True)
+BACK_KB = ReplyKeyboardMarkup([["🔙 Volver"]], resize_keyboard=True)
 
 class TelegramForwarderBot:
     def __init__(self, token):
@@ -49,7 +76,7 @@ class TelegramForwarderBot:
             return await update.message.reply_text(
                 "❌ *Acceso denegado.*",
                 parse_mode="Markdown",
-                reply_markup=MAIN_KEYBOARD
+                reply_markup=MAIN_KB
             )
         await self._show_main_menu(update)
 
@@ -61,13 +88,11 @@ class TelegramForwarderBot:
             f"📁 Listas: {len(self.config.get('listas_destinos',{}))}\n"
             f"📨 Mensajes: {len(self.mensajes)}\n"
             f"⏱️ Intervalo: {self.config.get('intervalo_segundos',60)}s\n"
-            f"🌐 Zona: `{self.config.get('zone','UTC')}`\n\n"
+            f"🌐 Zona: `{self.config.get('timezone','UTC')}`\n\n"
             "Selecciona una opción:"
         )
-        if update.callback_query:
-            await update.callback_query.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text(text, reply_markup=MAIN_KB, parse_mode="Markdown")
 
     async def message_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
@@ -77,12 +102,12 @@ class TelegramForwarderBot:
         text = update.message.text.strip()
         waiting = ctx.user_data.get("waiting_for")
 
-        # == Canal de Origen ==
+        # ── 1) Vincular Canal ──
         if text == "🔗 Vincular Canal":
             await update.message.reply_text(
-                "📤 *Reenvía un mensaje* desde tu canal para vincularlo.",
+                "📤 *Reenvía un mensaje* desde tu canal de origen.",
                 parse_mode="Markdown",
-                reply_markup=BACK_KEYBOARD
+                reply_markup=BACK_KB
             )
             ctx.user_data["waiting_for"] = "channel_forward"
             return
@@ -94,12 +119,12 @@ class TelegramForwarderBot:
             await update.message.reply_text(
                 f"✅ Canal vinculado: `{cid}`",
                 parse_mode="Markdown",
-                reply_markup=MAIN_KEYBOARD
+                reply_markup=MAIN_KB
             )
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Destinos ==
+        # ── 2) Gestión de Destinos ──
         if text == "📂 Destinos":
             kb = ReplyKeyboardMarkup([
                 ["➕ Agregar Destino","🗑️ Eliminar Destino"],
@@ -112,104 +137,99 @@ class TelegramForwarderBot:
 
         if waiting == "destinos_menu":
             if text == "➕ Agregar Destino":
-                await update.message.reply_text("📝 Envía el ID del destino:", reply_markup=BACK_KEYBOARD)
+                await update.message.reply_text("📝 Envía ID del destino:", reply_markup=BACK_KB)
                 ctx.user_data["waiting_for"] = "add_destino"
             elif text == "🗑️ Eliminar Destino":
                 ds = self.config.get("destinos",[])
                 if not ds:
-                    await update.message.reply_text("⚠️ No hay destinos.", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text("⚠️ No hay destinos.", reply_markup=MAIN_KB)
                 else:
                     lines = "\n".join(f"{i+1}. {d}" for i,d in enumerate(ds))
-                    await update.message.reply_text(
-                        f"🗑️ *Elige número a eliminar:*\n{lines}",
-                        parse_mode="Markdown", reply_markup=BACK_KEYBOARD
-                    )
+                    await update.message.reply_text(f"🗑️ Selecciona número:\n{lines}", parse_mode="Markdown", reply_markup=BACK_KB)
                     ctx.user_data["waiting_for"] = "del_destino"
             elif text == "📁 Crear Lista":
-                await update.message.reply_text("📌 Nombre de la nueva lista:", reply_markup=BACK_KEYBOARD)
+                await update.message.reply_text("📌 Nombre de la nueva lista:", parse_mode="Markdown", reply_markup=BACK_KB)
                 ctx.user_data["waiting_for"] = "new_list_name"
             elif text == "📂 Gestionar Listas":
                 lists = self.config.get("listas_destinos",{})
                 if not lists:
-                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KB)
                 else:
-                    menu = [[name] for name in lists.keys()]+[["🔙 Volver"]]
+                    menu = [[name] for name in lists.keys()] + [["🔙 Volver"]]
                     await update.message.reply_text("📂 *Listas Disponibles:*", parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup(menu,resize_keyboard=True))
                     ctx.user_data["waiting_for"] = "manage_lists"
             else:
-                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             return
 
-        # agregar destino
         if waiting == "add_destino":
             d = text
             if d not in self.config["destinos"]:
                 self.config["destinos"].append(d)
                 save_config(self.config)
-                await update.message.reply_text(f"✅ Destino `{d}` agregado.", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Destino `{d}` agregado.", reply_markup=MAIN_KB)
             else:
-                await update.message.reply_text("⚠️ Ya existe.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("⚠️ Ya existe.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # eliminar destino
         if waiting == "del_destino":
             try:
                 idx = int(text)-1
                 d = self.config["destinos"].pop(idx)
                 save_config(self.config)
-                await update.message.reply_text(f"✅ Destino `{d}` eliminado.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Destino `{d}` eliminado.", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # crear lista: nombre → pedir IDs
         if waiting == "new_list_name":
             ctx.user_data["new_list_name"] = text
-            await update.message.reply_text("📋 IDs separados por coma o línea:", reply_markup=BACK_KEYBOARD)
+            await update.message.reply_text("📋 Ahora envía los IDs (coma o línea):", reply_markup=BACK_KB)
             ctx.user_data["waiting_for"] = "new_list_ids"
             return
         if waiting == "new_list_ids":
             name = ctx.user_data.pop("new_list_name")
             ids = [x.strip() for x in text.replace("\n",",").split(",") if x.strip()]
-            self.config["listas_destinos"][name] = ids
+            self.config.setdefault("listas_destinos", {})[name] = ids
             save_config(self.config)
-            await update.message.reply_text(f"✅ Lista `{name}` creada.", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text(f"✅ Lista `{name}` creada con {len(ids)} destinos.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # gestionar listas
         if waiting == "manage_lists":
             if text == "🔙 Volver":
-                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             else:
                 name = text
                 if name in self.config["listas_destinos"]:
-                    kb = ReplyKeyboardMarkup([["📋 Ver","❌ Eliminar"],["🔙 Volver"]],resize_keyboard=True)
+                    kb = ReplyKeyboardMarkup([["📋 Ver","❌ Eliminar"],["🔙 Volver"]], resize_keyboard=True)
                     await update.message.reply_text(f"📂 *{name}* ({len(self.config['listas_destinos'][name])})", parse_mode="Markdown", reply_markup=kb)
                     ctx.user_data["waiting_for"] = f"list_{name}"
             return
 
-        # dentro de una lista:
         if waiting and waiting.startswith("list_"):
             name = waiting.split("_",1)[1]
             if text == "📋 Ver":
                 ids = self.config["listas_destinos"][name]
-                await update.message.reply_text("\n".join(ids) or "Ninguno", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("\n".join(ids) or "Ninguno", reply_markup=MAIN_KB)
             elif text == "❌ Eliminar":
                 self.config["listas_destinos"].pop(name, None)
                 save_config(self.config)
-                await update.message.reply_text(f"❌ Lista `{name}` eliminada.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"❌ Lista `{name}` eliminada.", reply_markup=MAIN_KB)
             else:
-                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Captura de mensaje reenviado ==
-        if update.message.forward_from_chat and str(update.message.forward_from_chat.id) == str(self.config.get("origen_chat_id")):
+        # ── 3) Captura de mensaje reenviado ──
+        if (
+            update.message.forward_from_chat
+            and str(update.message.forward_from_chat.id) == str(self.config.get("origen_chat_id"))
+        ):
             origen = update.message.forward_from_chat.id
             mid = update.message.forward_from_message_id
             nuevo = {
@@ -225,69 +245,68 @@ class TelegramForwarderBot:
             kb = ReplyKeyboardMarkup([
                 ["👥 A Todos","📋 Lista"],
                 ["✅ Guardar","❌ Cancelar"],
-                ["🏁 Finalizar"]
+                ["🏁 Finalizar"],["🔙 Volver"]
             ], resize_keyboard=True)
             await update.message.reply_text(
-                f"🔥 *Nuevo Mensaje Detectado!*\nID: `{mid}`",
+                f"🔥 *Nuevo Mensaje Detectado!*\nID: `{mid}`\nIntervalo por defecto: `{nuevo['intervalo_segundos']}s`\n\nElige destino:",
                 parse_mode="Markdown", reply_markup=kb
             )
             ctx.user_data["waiting_for"] = f"msg_cfg_{len(self.mensajes)-1}"
             return
 
-        # == Configuración puntual de mensaje reenviado ==
+        # ── 4) Configuración puntual de mensaje reenviado ──
         if waiting and waiting.startswith("msg_cfg_"):
             idx = int(waiting.split("_")[-1])
             m = self.mensajes[idx]
             if text == "👥 A Todos":
                 m["dest_all"], m["dest_list"] = True, None
                 save_mensajes(self.mensajes)
-                await update.message.reply_text("✅ Enviar a *todos*.", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("✅ Enviar a *todos*.", parse_mode="Markdown", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             elif text == "📋 Lista":
                 lists = self.config.get("listas_destinos",{})
                 if not lists:
-                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KB)
                     ctx.user_data.pop("waiting_for")
                 else:
-                    kb = ReplyKeyboardMarkup([[n] for n in lists]+[["🔙 Volver"]], resize_keyboard=True)
+                    kb = ReplyKeyboardMarkup([[n] for n in lists]+[["🔙 Volver"]],resize_keyboard=True)
                     await update.message.reply_text("📋 Elige lista:", reply_markup=kb)
                     ctx.user_data["waiting_for"] = f"msg_list_{idx}"
             elif waiting.startswith("msg_list_"):
                 if text == "🔙 Volver":
-                    await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
                 else:
                     name = text
                     m["dest_all"], m["dest_list"] = False, name
                     save_mensajes(self.mensajes)
-                    await update.message.reply_text(f"✅ Lista `{name}` seleccionada.", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text(f"✅ Lista `{name}` seleccionada.", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             elif text == "✅ Guardar":
-                await update.message.reply_text("✅ Mensaje guardado.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("✅ Mensaje guardado.", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             elif text == "❌ Cancelar":
                 self.mensajes.pop(idx)
                 save_mensajes(self.mensajes)
-                await update.message.reply_text("❌ Mensaje descartado.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Mensaje descartado.", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             elif text == "🏁 Finalizar":
-                # iniciar forwarder
                 if not hasattr(ctx.application, "forwarder_job"):
                     interval = self.config.get("intervalo_segundos",60)
                     ctx.application.forwarder_job = ctx.job_queue.run_repeating(
                         self._reenviar_mensajes, interval=interval, first=interval
                     )
-                await update.message.reply_text("🏁 ¡Reenvío iniciado!", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🏁 ¡Reenvío iniciado!", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             return
 
-        # == Editar Mensaje ==
+        # ── 5) Editar Mensaje ──
         if text == "✏️ Editar Mensaje":
             if not self.mensajes:
-                return await update.message.reply_text("⚠️ No hay mensajes.", reply_markup=MAIN_KEYBOARD)
+                return await update.message.reply_text("⚠️ No hay mensajes.", reply_markup=MAIN_KB)
             lines = [f"{i+1}. {m['message_id']} ({m['intervalo_segundos']}s)" for i,m in enumerate(self.mensajes)]
             await update.message.reply_text(
-                "✏️ *Selecciona número* para cambiar intervalo:\n"+ "\n".join(lines),
-                parse_mode="Markdown", reply_markup=BACK_KEYBOARD
+                "✏️ *Selecciona número* para cambiar intervalo:\n" + "\n".join(lines),
+                parse_mode="Markdown", reply_markup=BACK_KB
             )
             ctx.user_data["waiting_for"] = "edit_msg_select"
             return
@@ -296,10 +315,10 @@ class TelegramForwarderBot:
             try:
                 idx = int(text)-1
                 ctx.user_data["edit_idx"] = idx
-                await update.message.reply_text("🕒 *Nuevo intervalo* (s):", parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
+                await update.message.reply_text("🕒 *Nuevo intervalo* (s):", parse_mode="Markdown", reply_markup=BACK_KB)
                 ctx.user_data["waiting_for"] = "edit_msg_value"
             except:
-                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KB)
             return
 
         if waiting == "edit_msg_value":
@@ -308,20 +327,20 @@ class TelegramForwarderBot:
                 idx = ctx.user_data.pop("edit_idx")
                 self.mensajes[idx]["intervalo_segundos"] = v
                 save_mensajes(self.mensajes)
-                await update.message.reply_text(f"✅ Intervalo actualizado a {v}s", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Intervalo actualizado a {v}s", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Valor inválido.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Valor inválido.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Eliminar Mensaje ==
+        # ── 6) Eliminar Mensaje ──
         if text == "🗑️ Eliminar Mensaje":
             if not self.mensajes:
-                return await update.message.reply_text("⚠️ No hay mensajes.", reply_markup=MAIN_KEYBOARD)
+                return await update.message.reply_text("⚠️ No hay mensajes.", reply_markup=MAIN_KB)
             lines = [f"{i+1}. {m['message_id']}" for i,m in enumerate(self.mensajes)]
             await update.message.reply_text(
-                "🗑️ *Selecciona número* para eliminar:\n"+ "\n".join(lines),
-                parse_mode="Markdown", reply_markup=BACK_KEYBOARD
+                "🗑️ *Selecciona número* para eliminar:\n" + "\n".join(lines),
+                parse_mode="Markdown", reply_markup=BACK_KB
             )
             ctx.user_data["waiting_for"] = "del_msg_select"
             return
@@ -331,114 +350,115 @@ class TelegramForwarderBot:
                 idx = int(text)-1
                 m = self.mensajes.pop(idx)
                 save_mensajes(self.mensajes)
-                await update.message.reply_text(f"✅ Mensaje `{m['message_id']}` eliminado.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Mensaje `{m['message_id']}` eliminado.", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Cambiar Intervalo Global ==
+        # ── 7) Cambiar Intervalo Global/Mensaje/Lista ──
         if text == "🔁 Cambiar Intervalo":
-            kb = ReplyKeyboardMarkup([["🔁 Global","✏️ Por Mensaje"],["📋 Por Lista"],["🔙 Volver"]],resize_keyboard=True)
-            await update.message.reply_text("🕒 *Modo Intervalo*", parse_mode="Markdown", reply_markup=kb)
+            kb = ReplyKeyboardMarkup([
+                ["🔁 Global","✏️ Por Mensaje"],
+                ["📋 Por Lista","🔙 Volver"]
+            ], resize_keyboard=True)
+            await update.message.reply_text("🕒 *Modo Intervalo:*", parse_mode="Markdown", reply_markup=kb)
             ctx.user_data["waiting_for"] = "interval_menu"
             return
 
         if waiting == "interval_menu":
             if text == "🔁 Global":
-                await update.message.reply_text("🕒 *Nuevo intervalo global* (s):", parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
-                ctx.user_data["waiting_for"] = "interval_global"
+                await update.message.reply_text("🕒 *Nuevo global* (s):", parse_mode="Markdown", reply_markup=BACK_KB)
+                ctx.user_data["waiting_for"] = "int_global"
             elif text == "✏️ Por Mensaje":
-                await update.message.reply_text("✏️ *ID de mensaje*:", parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
-                ctx.user_data["waiting_for"] = "interval_msg_id"
+                await update.message.reply_text("✏️ *ID de mensaje*:", parse_mode="Markdown", reply_markup=BACK_KB)
+                ctx.user_data["waiting_for"] = "int_msg_id"
             elif text == "📋 Por Lista":
                 lists = self.config.get("listas_destinos",{})
                 if not lists:
-                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KEYBOARD)
+                    await update.message.reply_text("⚠️ No hay listas.", reply_markup=MAIN_KB)
                     ctx.user_data.pop("waiting_for")
                 else:
-                    kb = ReplyKeyboardMarkup([[n] for n in lists]+[["🔙 Volver"]],resize_keyboard=True)
-                    await update.message.reply_text("📋 *Elige lista*:", parse_mode="Markdown", reply_markup=kb)
-                    ctx.user_data["waiting_for"] = "interval_list_sel"
+                    kb2 = ReplyKeyboardMarkup([[n] for n in lists]+[["🔙 Volver"]], resize_keyboard=True)
+                    await update.message.reply_text("📋 Elige lista:", parse_mode="Markdown", reply_markup=kb2)
+                    ctx.user_data["waiting_for"] = "int_list_sel"
             else:
-                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             return
 
-        if waiting == "interval_global":
+        if waiting == "int_global":
             try:
                 v = int(text)
                 self.config["intervalo_segundos"] = v
                 save_config(self.config)
-                await update.message.reply_text(f"✅ Intervalo global: {v}s", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Intervalo global: {v}s", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Número inválido.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Número inválido.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        if waiting == "interval_msg_id":
+        if waiting == "int_msg_id":
             try:
                 idx = int(text)-1
-                ctx.user_data["interval_msg_idx"] = idx
-                await update.message.reply_text("🕒 *Nuevo intervalo* (s):",parse_mode="Markdown",reply_markup=BACK_KEYBOARD)
-                ctx.user_data["waiting_for"] = "interval_msg_val"
+                ctx.user_data["int_msg_idx"] = idx
+                await update.message.reply_text("🕒 *Nuevo intervalo* (s):", parse_mode="Markdown", reply_markup=BACK_KB)
+                ctx.user_data["waiting_for"] = "int_msg_val"
             except:
-                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Selección inválida.", reply_markup=MAIN_KB)
             return
 
-        if waiting == "interval_msg_val":
+        if waiting == "int_msg_val":
             try:
-                v = int(text)
-                idx = ctx.user_data.pop("interval_msg_idx")
+                v = int(text); idx = ctx.user_data.pop("int_msg_idx")
                 self.mensajes[idx]["intervalo_segundos"] = v
                 save_mensajes(self.mensajes)
-                await update.message.reply_text(f"✅ Mensaje {idx+1}: {v}s", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Mensaje {idx+1}: {v}s", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Error.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Error.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        if waiting == "interval_list_sel":
+        if waiting == "int_list_sel":
             if text == "🔙 Volver":
-                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("🔙 Volver al menú", reply_markup=MAIN_KB)
                 ctx.user_data.pop("waiting_for")
             else:
-                ctx.user_data["interval_list_name"] = text
-                await update.message.reply_text("🕒 *Nuevo intervalo* (s):", parse_mode="Markdown", reply_markup=BACK_KEYBOARD)
-                ctx.user_data["waiting_for"] = "interval_list_val"
+                ctx.user_data["int_list_name"] = text
+                await update.message.reply_text("🕒 *Nuevo intervalo* (s):", parse_mode="Markdown", reply_markup=BACK_KB)
+                ctx.user_data["waiting_for"] = "int_list_val"
             return
 
-        if waiting == "interval_list_val":
+        if waiting == "int_list_val":
             try:
-                name = ctx.user_data.pop("interval_list_name")
-                v = int(text)
+                v = int(text); name = ctx.user_data.pop("int_list_name")
                 for m in self.mensajes:
                     if m.get("dest_list")==name:
                         m["intervalo_segundos"] = v
                 save_mensajes(self.mensajes)
-                await update.message.reply_text(f"✅ Lista `{name}`: {v}s", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Lista `{name}`: {v}s", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Error.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Error.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Cambiar Zona ==
+        # ── 8) Cambiar Zona Horaria ──
         if text == "🌐 Cambiar Zona":
-            await update.message.reply_text("🌍 Nueva zona (p.ej. Europe/Madrid):", reply_markup=BACK_KEYBOARD)
+            await update.message.reply_text("🌐 *Nueva zona* (p.ej. Europe/Madrid):", parse_mode="Markdown", reply_markup=BACK_KB)
             ctx.user_data["waiting_for"] = "timezone"
             return
         if waiting == "timezone":
             try:
                 pytz.timezone(text)
-                self.config["zone"] = text
+                self.config["timezone"] = text
                 save_config(self.config)
-                await update.message.reply_text(f"✅ Zona: `{text}`", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text(f"✅ Zona: `{text}`", parse_mode="Markdown", reply_markup=MAIN_KB)
             except:
-                await update.message.reply_text("❌ Zona inválida.", reply_markup=MAIN_KEYBOARD)
+                await update.message.reply_text("❌ Zona inválida.", reply_markup=MAIN_KB)
             ctx.user_data.pop("waiting_for")
             return
 
-        # == Estado del Bot ==
+        # ── 9) Estado del Bot ──
         if text == "📄 Estado del Bot":
             await self._show_main_menu(update)
             return
@@ -466,8 +486,7 @@ class TelegramForwarderBot:
         app = Application.builder().token(self.token).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(MessageHandler(filters.ALL, self.message_handler))
-        # arrancar forwarder después de /start
-        app.job_queue.run_once(lambda c: None, when=0)
+        # al iniciar, dejamos listo el forwarder (se activará tras “🏁 Finalizar”)
         logger.info("🚀 Bot iniciado")
         app.run_polling()
 
